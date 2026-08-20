@@ -9,9 +9,12 @@ from time import monotonic
 
 from azure.identity import DefaultAzureCredential
 from azure.monitor.query import LogsQueryClient
+from dotenv import load_dotenv
 from fastmcp import FastMCP
 
-WORKSPACE_ID = os.environ.get("AZURE_LOG_ANALYTICS_WORKSPACE_ID", None)
+load_dotenv()
+
+WORKSPACE_ID = os.environ.get("AZURE_LOG_ANALYTICS_WORKSPACE_ID")
 CACHE_TTL_SECONDS = 300
 MAX_DURATION_DAYS = 30
 
@@ -100,6 +103,11 @@ def run_kql_query(query: str, duration: str = "24h") -> list[dict]:
     }[unit]
     if duration_days <= 0 or duration_days > MAX_DURATION_DAYS:
         raise ValueError(f"duration must be greater than 0 and no more than {MAX_DURATION_DAYS} days")
+    if not WORKSPACE_ID:
+        raise ValueError(
+            "AZURE_LOG_ANALYTICS_WORKSPACE_ID is not configured. "
+            "Set it in the environment or in a .env file."
+        )
 
     client = get_logs_client()
 

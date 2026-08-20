@@ -10,7 +10,7 @@ from azure.core.exceptions import ClientAuthenticationError, HttpResponseError
 from azure.identity import CredentialUnavailableError
 
 from openai import AzureOpenAI
-from mcp_server import get_table_schema, list_log_tables, run_kql_query
+from azure_mcp import get_table_schema, list_log_tables, run_kql_query
 
 logger = logging.getLogger(__name__)
 
@@ -92,31 +92,41 @@ def compact_schemas(schemas):
     return compacted
 
 
-def build_result_summary(results):
-    row_count = len(results)
-    if not results:
-        return "Summary: No records matched the query.\nRecommendation: Try a longer time window or a broader filter."
+def build_result_summary(question, query, results):
+    result_context = json.dumps(results[:100], default=str)
+    if len(result_context) > 30_000:
+        result_context = result_context[:30_000] + "\n[Results truncated]"
 
-    models = sorted({
-        str(row[key])
-        for row in results
-        for key in ("modelName", "ModelName", "modelDeploymentName")
-        if row.get(key)
-    })
-    statuses = sorted({
-        str(row[key])
-        for row in results
-        for key in ("ResultSignature", "StatusCode", "status_s", "httpStatusCode_d")
-        if row.get(key) is not None and row.get(key) != ""
-    })
-
-    lines = [f"Summary: The query returned {row_count} record(s)."]
-    if models:
-        lines.append(f"Models used: {', '.join(models)}")
-    if statuses:
-        lines.append(f"Status codes: {', '.join(statuses)}")
-    lines.append("Recommendation: Review the returned records and narrow the filters if needed.")
-    return "\n".join(lines)
+    try:
+        response = create_completion_with_retry(
+            model="gpt-5-mini",
+            messages=[
+                {
+                    "role": "system",
+                    "content": """
+You are an Azure Log Analytics analyst. Summarize the findings in the supplied query results for the user.
+Base every claim only on the supplied data. Explain the most important patterns, counts, errors, trends, or anomalies
+that answer the question. Mention when the data is insufficient to support a conclusion. End with one practical
+recommendation when appropriate. Be concise and do not describe your role or the summarization process.
+"""
+                },
+                {
+                    "role": "user",
+                    "content": (
+                        f"User question:\n{question}\n\n"
+                        f"Generated KQL:\n{query}\n\n"
+                        f"Query results (up to the first 100 rows):\n{result_context}"
+                    )
+                }
+            ],
+        )
+        summary = response.choices[0].message.content
+        if isinstance(summary, str) and summary.strip():
+            return summary.strip()
+        raise ValueError("summary response was empty")
+    except Exception:
+        logger.exception("Result-summary model call failed")
+        return "I retrieved the query results, but I could not generate a findings summary. Review the raw results below."
 
 
 def validate_generated_kql(query, selected_tables):
@@ -332,7 +342,7 @@ Always call run_kql_query. Do not use any other tables.
         logger.exception("Generated KQL execution failed")
         return query, [], azure_failure_message("execute the generated KQL", error)
 
-    answer = build_result_summary(results)
+    answer = build_result_summary(question, query, results)
 
     return query, results, answer
 
@@ -341,27 +351,76 @@ st.set_page_config(
     layout="wide"
 )
 
-st.title("Azure OpenAI Log Analytics Agent")
+st.markdown(
+    """
+    <style>
+    [data-testid="stHeader"] {
+        display: none;
+    }
+    [data-testid="stAppViewContainer"] > .main {
+        padding-top: 4.75rem;
+    }
+    .agent-navbar {
+        align-items: center;
+        background: #102a43;
+        border-bottom: 3px solid #f0b429;
+        color: #f7f9fc;
+        display: flex;
+        height: 3.75rem;
+        left: 0;
+        padding: 0 2rem;
+        position: fixed;
+        right: 0;
+        top: 0;
+        z-index: 1000;
+    }
+    .agent-navbar-title {
+        font-size: 1.05rem;
+        font-weight: 700;
+        letter-spacing: .01em;
+    }
+    .agent-navbar-subtitle {
+        color: #bcccdc;
+        font-size: .82rem;
+        margin-left: 1rem;
+    }
+    @media (max-width: 640px) {
+        .agent-navbar {
+            padding: 0 1rem;
+        }
+        .agent-navbar-subtitle {
+            display: none;
+        }
+    }
+    </style>
+    <nav class="agent-navbar" aria-label="Application navigation">
+        <span class="agent-navbar-title">Azure OpenAI Log Analytics Agent</span>
+        <span class="agent-navbar-subtitle">KQL workspace assistant</span>
+    </nav>
+    """,
+    unsafe_allow_html=True,
+)
 
 if "messages" not in st.session_state:
     st.session_state.messages = []
 
-for message in st.session_state.messages:
-    with st.chat_message(message["role"]):
-        st.markdown(message["content"])
+with st.container(height=620, border=False):
+    for message in st.session_state.messages:
+        with st.chat_message(message["role"]):
+            st.markdown(message["content"])
 
-        if message["role"] == "assistant" and message.get("query"):
-            with st.expander("Generated KQL"):
-                st.code(message["query"], language="sql")
+            if message["role"] == "assistant" and message.get("query"):
+                with st.expander("Generated KQL"):
+                    st.code(message["query"], language="sql")
 
-            with st.expander("Raw Results"):
-                if message["results"]:
-                    st.dataframe(
-                        pd.DataFrame(message["results"]),
-                        use_container_width=True
-                    )
-                else:
-                    st.info("No records returned.")
+                with st.expander("Raw Results"):
+                    if message["results"]:
+                        st.dataframe(
+                            pd.DataFrame(message["results"]),
+                            use_container_width=True
+                        )
+                    else:
+                        st.info("No records returned.")
 
 question = st.chat_input("Ask about your Azure logs...")
 
