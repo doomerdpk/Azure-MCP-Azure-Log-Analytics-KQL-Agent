@@ -1,0 +1,6 @@
+azure-identity
+azure-monitor-query
+fastmcp
+openai
+pandas
+streamlit
